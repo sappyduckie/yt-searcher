@@ -1,0 +1,10 @@
+[package]
+name = "youtube_recurse"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rand = "0.9.1"
+tokio = { version = "1.45.1", features = ["full"] }
+reqwest = "0.12.21"
+scraper = "0.23.1"
