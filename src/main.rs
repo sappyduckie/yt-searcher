@@ -158,9 +158,9 @@ async fn main() {
             // Calculate URLs per second since last update
             let rate = (current_count - last_count) as f64 / elapsed;
             
-            // Print progress on same line (\\r returns cursor to beginning of line)
+            // Print progress on same line (\r returns cursor to beginning of line)
             // This creates a live-updating display instead of printing new lines
-            print!("\\rChecked: {} | Speed: {:.0} URLs/s", current_count, rate);
+            print!("\rChecked: {} | Speed: {:.0} URLs/s", current_count, rate);
             io::stdout().flush().unwrap(); // Force immediate output to console
             
             // Update tracking variables for next iteration
@@ -218,6 +218,6 @@ async fn main() {
     if let Some(url) = rx.recv().await {
         // Print a newline first to avoid overwriting the progress display
         // Then show the successful URL
-        println!("\\nFound valid YouTube video: {}", url);
+        println!("\nFound valid YouTube video: {}", url);
     }
 }
