@@ -1,145 +1,223 @@
-use rand::Rng;
-use std::io::{self, Write};
-use reqwest::Client;
-use scraper::{Html, Selector};
-use std::sync::OnceLock;
-// use tokio::sync::Semaphore;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use futures::future::join_all;
-
-// Pre-compile selectors at startup
-static VIDEO_SELECTOR: OnceLock<Selector> = OnceLock::new();
-static UNAVAILABLE_SELECTOR: OnceLock<Selector> = OnceLock::new();
-static TITLE_SELECTOR: OnceLock<Selector> = OnceLock::new();
-fn init_selectors() {
-    VIDEO_SELECTOR.set(Selector::parse("#movie_player, .html5-video-player").unwrap()).unwrap();
-    UNAVAILABLE_SELECTOR.set(Selector::parse("#player-unavailable, .player-unavailable").unwrap()).unwrap();
-    TITLE_SELECTOR.set(Selector::parse(r#"meta[property="og:title"]"#).unwrap()).unwrap();
-}
-
-struct URLCounter {
-    count: usize,
-    start_time: std::time::Instant,
-    last_printed: std::time::Instant,
-} impl URLCounter {
-    fn increment(&mut self) {
-        self.count += 1;
-        let now = std::time::Instant::now();
-        
-        // Cache the duration check to avoid repeated calculations
-        if now.duration_since(self.last_printed).as_secs() >= 1 {
-            let elapsed_secs = self.start_time.elapsed().as_secs();
-            let urls_per_second = if elapsed_secs > 0 { 
-                self.count / elapsed_secs as usize 
-            } else { 
-                0 
-            };
-            
-            print!("\rURLs: {} | Speed: {} URLs/s | Time: {}s", 
-                   self.count, urls_per_second, elapsed_secs);
-            io::stdout().flush().unwrap();
-            self.last_printed = now;
-        }
-    }
-}
-
+// Import necessary libraries for our YouTube URL searcher
+use rand::Rng;                                    // For generating random numbers/characters
+use std::io::{self, Write};                       // For console output and flushing stdout
+use reqwest::Client;                              // HTTP client for making web requests
+use std::sync::Arc;                               // For sharing data between threads safely
+use tokio::sync::mpsc;                            // Multi-producer, single-consumer channel for async communication
+use std::sync::atomic::{AtomicUsize, Ordering};   // Atomic counter for thread-safe counting without locks
+ 
+/*
+ * Generates a random YouTube URL with a valid video ID format
+ * 
+ * YouTube video IDs are 11 characters long and use base64-like encoding
+ * with characters A-Z, a-z, 0-9, and the special characters - and _
+ * 
+ * Returns: A string in the format "https://www.youtube.com/watch?v=XXXXXXXXXXX"
+ */
 fn generate_url() -> String {
-    // YouTube IDs are base64-like but use - and _ instead of + and /
+    // Define the character set used in YouTube video IDs
+    // This matches YouTube's actual character set for video IDs
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let random_hash: String = (0..11)
-        .map(|_| {
-            let idx = rand::rng().random_range(0..CHARSET.len());
-            CHARSET[idx] as char
-        })
+    
+    // Get a thread-local random number generator for performance
+    let mut rng = rand::rng();
+    
+    // Generate an 11-character random string by:
+    // 1. Creating a range from 0 to 11 (YouTube video IDs are exactly 11 chars)
+    // 2. For each position, pick a random character from our charset
+    // 3. Convert the byte to a char and collect into a String
+    let hash: String = (0..11)
+        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
         .collect();
-    format!("https://www.youtube.com/watch?v={}", random_hash)
+    
+    // Format the random hash into a proper YouTube watch URL
+    format!("https://www.youtube.com/watch?v={}", hash)
 }
 
-// Lightweight function to check if a YouTube URL has an actual video
-async fn check_youtube_video(client: &Client, url: &str) -> Result<bool, Box<dyn std::error::Error>> {
+/*
+ * Checks if a YouTube URL actually contains a valid, accessible video
+ * 
+ * This function performs a lightweight check by:
+ * 1. Making an HTTP GET request to the URL
+ * 2. Checking the response status code
+ * 3. Analyzing the HTML content for video indicators
+ * 4. Avoiding expensive HTML parsing by using simple string searches
+ * 
+ * Args:
+ *   client: Shared HTTP client for making requests
+ *   url: The YouTube URL to check
+ * 
+ * Returns: 
+ *   Ok(true) if the URL contains a valid video
+ *   Ok(false) if no video is found or video is unavailable
+ *   Err if there's a network or parsing error
+ */
+async fn check_youtube_video(client: &Client, url: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    // Make HTTP GET request to the YouTube URL
+    // We set a realistic User-Agent to avoid being blocked as a bot
     let response = client
         .get(url)
-        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
-        .header("Accept", "text/html,application/xhtml+xml")
-        .header("Accept-Encoding", "gzip, deflate")
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         .send()
         .await?;
-    
-    // Check status code first (faster than parsing HTML)
-    match response.status().as_u16() {
-        200 => {
-            let html = response.text().await?;
-            // Only parse if response looks like it contains video data
-            if html.contains("ytInitialData") || html.contains("movie_player") {
-                let document = Html::parse_document(&html);
-                return Ok(document.select(VIDEO_SELECTOR.get().unwrap()).next().is_some());
-            }
-            Ok(false)
-        },
-        404 | 410 => Ok(false), // Definitely no video
-        _ => Ok(false)
+
+    // Quick check: if the response isn't HTTP 200 OK, there's no video
+    // This catches deleted videos, private videos, etc. without parsing HTML
+    if response.status() != 200 {
+        return Ok(false);
     }
+
+    // Get the full HTML response body
+    // This is necessary to check for video content indicators
+    let html = response.text().await?;
+    
+    // Check for common "video unavailable" indicators in the HTML
+    // These strings appear when videos are deleted, private, or region-blocked
+    // This is much faster than parsing the full HTML structure
+    if html.contains("Video unavailable") || 
+       html.contains("This video is not available") ||
+       html.contains("Private video") ||
+       html.contains("This video has been removed") {
+        return Ok(false);
+    }
+    
+    // Check for positive indicators that a video exists and is playable
+    // ytInitialData: JavaScript object containing video metadata
+    // videoDetails: Specific section with video information
+    // watch?v=: Confirms this is a watch page (not a channel, playlist, etc.)
+    Ok(html.contains("ytInitialData") && 
+       (html.contains("videoDetails") || html.contains("watch?v=")))
 }
 
-#[tokio::main]
+/*
+ * Main function: Orchestrates the YouTube URL search operation
+ * 
+ * This program uses a brute-force approach to find valid YouTube videos by:
+ * 1. Generating millions of random YouTube URLs
+ * 2. Testing each URL concurrently across many worker tasks
+ * 3. Stopping as soon as we find the first valid video
+ * 
+ * The approach is highly parallelized to maximize throughput, using:
+ * - Atomic counters for thread-safe counting without locks
+ * - Hundreds of concurrent worker tasks
+ * - Optimized HTTP client settings
+ * - Async/await for non-blocking I/O operations
+ */
+#[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    // Initialize selectors once at startup
-    init_selectors();
+    
+    // Create an atomic counter to track how many URLs we've checked
+    // AtomicUsize allows multiple threads to increment safely without mutex locks
+    // This is much faster than using a Mutex<usize> for high-frequency updates
+    let counter = Arc::new(AtomicUsize::new(0));
 
-    // Initialize URL counter
-    let counter = Arc::new(Mutex::new(URLCounter {
-        count: 0,
-        start_time: std::time::Instant::now(),
-        last_printed: std::time::Instant::now(),
-    }));
-
-    // Create a reqwest client
+    // Create and configure the HTTP client for optimal performance
+    // Arc allows us to share the same client across all worker threads
     let client = Arc::new(Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .pool_max_idle_per_host(50)
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
-        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_millis(800))     // Max 800ms per request
+        .connect_timeout(std::time::Duration::from_millis(500)) // Max 500ms to establish connection
+        .pool_max_idle_per_host(0)                          // Unlimited connection pooling
+        .pool_idle_timeout(std::time::Duration::from_secs(20))  // Keep connections alive for 20s
+        .tcp_keepalive(std::time::Duration::from_secs(30))      // TCP keepalive every 30s
+        .tcp_nodelay(true)                                      // Disable Nagle's algorithm for lower latency
+        .http2_prior_knowledge()                                // Use HTTP/2 when possible for better performance
         .build()
         .unwrap());
+
+    // Create a channel for communication between worker threads and main thread
+    // Workers will send successful URLs through this channel
+    // mpsc = Multi-Producer, Single-Consumer (many workers, one main thread)
+    let (tx, mut rx) = mpsc::unbounded_channel();
     
-    // Limit concurrent requests to avoid overwhelming YouTube if needed
-    // let semaphore = Arc::new(Semaphore::new(20));
+    // Calculate how many worker threads to spawn
+    // We use CPU count × 500 because this is I/O bound work (network requests)
+    // I/O bound tasks can have many more threads than CPU cores since they spend
+    // most time waiting for network responses, not using CPU
+    let cpu_count = std::thread::available_parallelism().unwrap().get();
+    let num_workers = cpu_count * 1000;
     
-    loop {
-        let mut tasks = Vec::new();
+    println!("Starting {} workers on {} CPUs", num_workers, cpu_count);
+    
+    // Spawn a dedicated task for displaying progress statistics
+    // This runs independently and updates the console every second
+    let counter_clone = Arc::clone(&counter);
+    tokio::spawn(async move {
+        let mut last_count = 0;                    // URLs checked at last update
+        let mut last_time = std::time::Instant::now(); // Time of last update
         
-        // Create batch of concurrent requests
-        for _ in 0..50 {
-            let client = Arc::clone(&client);
-            let counter = Arc::clone(&counter);
-            // let semaphore = Arc::clone(&semaphore);
+        // Infinite loop to continuously update progress display
+        loop {
+            // Wait 1 second between updates to avoid spamming the console
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             
-            // Create the future directly instead of spawning
-            let future = async move {
-                // let _permit = semaphore.acquire().await.unwrap();
+            // Get current statistics
+            let current_count = counter_clone.load(Ordering::Relaxed);  // Total URLs checked
+            let now = std::time::Instant::now();                       // Current time
+            let elapsed = now.duration_since(last_time).as_secs_f64(); // Time since last update
+            
+            // Calculate URLs per second since last update
+            let rate = (current_count - last_count) as f64 / elapsed;
+            
+            // Print progress on same line (\\r returns cursor to beginning of line)
+            // This creates a live-updating display instead of printing new lines
+            print!("\\rChecked: {} | Speed: {:.0} URLs/s", current_count, rate);
+            io::stdout().flush().unwrap(); // Force immediate output to console
+            
+            // Update tracking variables for next iteration
+            last_count = current_count;
+            last_time = now;
+        }
+    });
+    
+    // Spawn all the worker tasks that will do the actual URL testing
+    // Each worker runs independently and concurrently with others
+    for _ in 0..num_workers {
+        // Clone the shared resources for this worker
+        // Arc::clone creates a new reference to the same data, not a deep copy
+        let client = Arc::clone(&client);     // HTTP client for making requests
+        let counter = Arc::clone(&counter);   // Shared counter for statistics
+        let tx = tx.clone();                  // Channel sender for reporting success
+        
+        // Spawn an async task that will run on the tokio thread pool
+        // Each task is independent and runs the worker loop
+        tokio::spawn(async move {
+            // Worker main loop: generate and test URLs until we find a valid one
+            loop {
+                // Generate a random YouTube URL to test
                 let url = generate_url();
                 
+                // Test if this URL contains a valid video
                 match check_youtube_video(&client, &url).await {
-                    Ok(true) => Some(url),
+                    Ok(true) => {
+                        // Success! We found a valid video
+                        // Send the URL through the channel to the main thread
+                        let _ = tx.send(url);
+                        // Exit this worker - our job is done
+                        return;
+                    }
                     _ => {
-                        counter.lock().await.increment();
-                        None
+                        // No video found (or error occurred)
+                        // Increment the counter to track our progress
+                        // fetch_add atomically adds 1 and returns the previous value
+                        // Ordering::Relaxed is fastest - we don't need strict ordering
+                        counter.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-            };
-            tasks.push(future);
-        }
-        
-        // Wait for batch completion
-        let results = join_all(tasks).await;
-        
-        // Check if any valid URL was found
-        for result in results {
-            if let Some(url) = result {
-                println!("\nFound valid YouTube video: {}", url);
-                return;
+                // Loop continues to try the next URL
             }
-        }
+        });
+    }
+    
+    // Close the sending side of the channel
+    // This allows the receiving side to know when all workers are done
+    // (though in practice, we expect to find a video before that happens)
+    drop(tx);
+    
+    // Wait for the first worker to find a valid YouTube video
+    // rx.recv() blocks until a message is received through the channel
+    if let Some(url) = rx.recv().await {
+        // Print a newline first to avoid overwriting the progress display
+        // Then show the successful URL
+        println!("\\nFound valid YouTube video: {}", url);
     }
 }
