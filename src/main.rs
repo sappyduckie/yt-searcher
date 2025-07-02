@@ -134,7 +134,7 @@ async fn main() {
     // I/O bound tasks can have many more threads than CPU cores since they spend
     // most time waiting for network responses, not using CPU
     let cpu_count = std::thread::available_parallelism().unwrap().get();
-    let num_workers = cpu_count * 1000;
+    let num_workers = cpu_count * 10000;
     
     println!("Starting {} workers on {} CPUs", num_workers, cpu_count);
     
